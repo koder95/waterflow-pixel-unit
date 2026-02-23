@@ -12,6 +12,7 @@ class WaterflowDriver:
         self.offPin = Pin(20, Pin.OUT, value=0)
         self.restartCountdown = -1
         self.time = LocalTime()
+        self.time.timeZoneRTCCorrection()
         self.onTime = 72000
         self.offTime = 28800
         self.timeDependency = True
@@ -65,10 +66,14 @@ class WaterflowDriver:
     
     async def nextStep(self):
         state = self.on
-        if (self.sensorDependency and self.on):
+        if self.sensorDependency and self.on:
             state = not self.sensorPin.value()
-        if (self.timeDependency and self.on):
-            state = state and (self.onTime > self.time.timestamp() or self.offTime < self.time.timestamp())
+        if self.timeDependency and self.on:
+            tmstmp = self.time.timestamp()
+            if self.onTime < self.offTime:
+                state = state and (self.onTime <= tmstmp and self.offTime >= tmstmp)
+            else:
+                state = state and (self.onTime >= tmstmp and self.offTime <= tmstmp)
         self.stateAction(state)
         
     async def prepareStep(self):
@@ -102,9 +107,9 @@ class WaterflowDriver:
                 if ("timeDependency" in self.data):
                     self.timeDependency = self.data["timeDependency"]
                 if ("onTime" in self.data):
-                    self.onTime = LocalTime().timestamp(self.data["onTime"])
+                    self.onTime = self.data["onTime"]
                 if ("offTime" in self.data):
-                    self.offTime = LocalTime().timestamp(self.data["offTime"])
+                    self.offTime = self.data["offTime"]
                 if ("on" in self.data):
                     self.on = self.data["on"]
                 if ("nol" in self.data):

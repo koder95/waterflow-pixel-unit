@@ -14,6 +14,9 @@ def fetch(synch_with_rtc=True, timeout=10):
     data = socket.recv(48)
     socket.close()
     local_epoch = 2208988800 # selected by Chris - blame him. :-D
+    if time.gmtime(0)[0] == 2000:
+        # (date(2000, 1, 1) - date(1900, 1, 1)).days * 24*60*60
+        local_epoch = 3155673600
     timestamp = struct.unpack("!I", data[40:44])[0] - local_epoch
     timestamp = time.gmtime(timestamp)
   except Exception as e:

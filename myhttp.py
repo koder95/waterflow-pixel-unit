@@ -1,62 +1,29 @@
-from phew import server, connect_to_wifi, access_point, logging
+from phew import server, connect_to_wifi, access_point, logging, ntp
 from network import hostname
 import uasyncio
 import machine
 import json
 import config
 from waterflowdriver import WaterflowDriver
+import ubinascii
+import auth
+from utils import load_json, save_json
 
-def load_json(filename):
-    try:
-        with open(filename, 'r') as f:
-            return json.load(f)
-    except:
-        logging.debug(f'Cannot read: {filename}')
-        return { }
-
-def save_json(filename, content):
-    try:
-        with open(filename, 'w') as f:
-            json.dump(content, f)
-            return True
-    except:
-        logging.debug(f'Cannot write {content} into {filename}')
-        return False
 
 net = load_json('net.json')
 driver = WaterflowDriver()
 name = config.device['application-name']
 hostname(name)
 ip = connect_to_wifi(net['ssid'], net['pass'])
-if (ip is None):
+if ip is None:
     ip = access_point(net['ap-ssid'], net['ap-pass'])
     print('AP IP', ip)
     logging.info(f'> {name} – uruchomiono AP: IP ({ip})')
 else:
     print('IP', ip)
     logging.info(f'> {name} – połączenie z siecią: IP ({ip})')
-    import ntptime
-    ntptime.settime()
-
-def generate_token():
-    import ubinascii
-    import random
-    r = bytearray(random.randbytes(32))
-    rhex = ubinascii.hexlify(r)
-    return ubinascii.b2a_base64(rhex).strip()
-
-def refresh_token(username):
-    users = load_json('users.json')
-    if (username in users):
-        users[username]['token'] = generate_token()
-        if (save_json('users.json', users)):
-            logging.info(f'> refresh token for {username}')
-            return {"token": users[username]['token'], "user": username}
-        else:
-            logging.debug(f'> cannot refresh token for {username}')
-            return {'message': 'Cannot generate access token. Try again.'}
-    else:
-        return {'message': f'User {username} not exists'}
+    ntp.fetch()
+auth.ensure_default_setup()
 
 def load_logs():
     filename = logging.log_file
@@ -76,129 +43,185 @@ def get_device_info(request):
 def get_logs(request):
     content = load_logs()
     lines = content.split("\n")
-    return json.dumps(lines), 200, {"Content-type": "application/json"}    
+    return json.dumps(lines), 200, {"Content-type": "application/json"}
+
+@server.route("/api/logs", methods=["DELETE"])
+def clear_logs(request):
+    user = auth.authenticate(request)
+    if not user:
+        return json.dumps({"message": "Unauthorized"}), 401, {"Content-type": "application/json"}
+    if not auth.authorize(user, ["admin"]):
+        return json.dumps({"message": "Forbidden"}), 403, {"Content-type": "application/json"}
+    
+    import os
+    filename = logging.log_file
+    content = load_logs()
+    try:
+        os.remove(filename)
+        logging.info('> log clear')
+    except:
+        logging.debug(f'Cannot clear log file')
+        return json.dumps({"message": "Internal Server Error"}), 500, {"Content-type": "application/json"}
+    newCredentials = auth.refresh_token(user)
+    return json.dumps({"logs": content.split("\n"), "newCredentials": newCredentials}), 200, {"Content-type": "application/json"}
 
 @server.route("/api/restart", methods=["POST"])
 def restart(request):
+    user = auth.authenticate(request)
+    if not user:
+        return json.dumps({"message": "Unauthorized"}), 401, {"Content-type": "application/json"}
+    if not auth.authorize(user, ["admin", "editor"]):
+        return json.dumps({"message": "Forbidden"}), 403, {"Content-type": "application/json"}
+
     logging.info('> restarting by http request')
     restartCountdown = 10
-    if ("defaultRestartCountdown" in driver.data):
+    if "defaultRestartCountdown" in driver.data:
         restartCountdown = driver.data["defaultRestartCountdown"]
+    newCredentials = auth.refresh_token(user)
     driver.restartCountdown = restartCountdown
-    return json.dumps({"restartCountdown": restartCountdown}), 200, {"Content-type": "application/json"}
+    return json.dumps({"restartCountdown": restartCountdown, "newCredentials": newCredentials}), 200, {"Content-type": "application/json"}
 
 @server.route("/api/secure/admin/reset", methods=["POST"])
 def reset_admin_pass(request):
-    if ('secure' in request.headers):
-        if (request.headers['secure'] == config.secured['secure']):
-            users = load_json('users.json')
-            if ('pass' in request.data):
-                users['admin']['pass'] = request.data['pass']
-                if (len(users['admin']['pass']) > 6):
-                    if (save_json('users.json', users)):
-                        return json.dumps({"message": "Password was changed successfully."}), 202, {"Content-type": "application/json"}
-                    else:
-                        return json.dumps({"message": "Password was not changed. Cannot rewrite file!"}), 500, {"Content-type": "application/json"}
-                else:
-                    return json.dumps({"message": "Password was not changed. New password must restrict password rules."}), 406, {"Content-type": "application/json"}
-            else:
-                return json.dumps({"message": "Password was not changed. Enter new password."}), 400, {"Content-type": "application/json"}
-        else:
-            return json.dumps({"message": "Password was not changed. Access denied."}), 401, {"Content-type": "application/json"}
-    else:
-        return json.dumps({"message": "Password was not changed. Special key is required."}), 401, {"Content-type": "application/json"}
-                
+    if 'secure' not in request.headers or request.headers['secure'] != config.secured['secure']:
+        return json.dumps({"message": "Unauthorized"}), 401, {"Content-type": "application/json"}
+    
+    users = load_json('users.json')
+    if 'pass' not in request.data:
+        return json.dumps({"message": "Bad Request"}), 400, {"Content-type": "application/json"}
 
-@server.route("/api/secure/access", methods=["POST"])
-def user_access(request):
-    if ('user' in request.headers):
-        username = request.headers['user']
-        if ('pass' in request.headers):
-            password = request.headers['pass']
-            users = load_json('users.json')
-            if (username in users):
-                if (password == users[username]['pass']):
-                    users[username]['token'] = generate_token()
-                    if (save_json('users.json', users)):
-                        logging.info(f'> new access token generated for {username}')
-                        return json.dumps({"token": users[username]['token'], "user": username}), 200, {"Content-type": "application/json"}
-                    else:
-                        logging.info(f'> cannot generate access token for {username} – saving problems')
-                        return json.dumps({'message': 'Cannot generate access token. Try again.'}), 500, {"Content-type": "application/json"}
-            return json.dumps({'message': f'User "{username}" not exists or password is incorrect'}), 401, {"Content-type": "application/json"}
-        return json.dumps({'message': 'Enter a password'}), 401, {"Content-type": "application/json"}
-    return json.dumps({'message': 'Enter a username'}), 401, {"Content-type": "application/json"}
+    if len(request.data['pass']) < 7:
+        return json.dumps({"message": "Not Acceptable"}), 406, {"Content-type": "application/json"}
+
+    users['admin']['pass'] = request.data['pass']
+    if save_json('users.json', users):
+        return json.dumps({"message": "Accepted"}), 202, {"Content-type": "application/json"}
+    else:
+        return json.dumps({"message": "Internal Server Error"}), 500, {"Content-type": "application/json"}
+
+@server.route("/api/secure/auth", methods=["POST"])
+def user_auth(request):
+    auth.apply_auth_headers(request)
+    if 'user' not in request.headers or 'pass' not in request.headers:
+        return json.dumps({'message': 'Unauthorized'}), 401, {"Content-type": "application/json"}
+    username = request.headers['user']
+    password = request.headers['pass']
+    users = load_json('users.json')
+    if username not in users or password != users[username]['pass']:
+        return json.dumps({'message': 'Unauthorized'}), 401, {"Content-type": "application/json"}
+    
+    return json.dumps(auth.refresh_token(username)), 200, {"Content-type": "application/json"}
+    
 
 @server.route("/api/secure/pass", methods=["PATCH"])
 def user_pass_change(request):
-    if ('user' in request.headers):
-        username = request.headers['user']
-        if ('token' in request.headers):
-            token = request.headers['token']
-            users = load_json('users.json')
-            if (username in users):
-                if (token == users[username]['token']):
-                    if ('pass' in request.data):
-                        users[username]['pass'] = request.data['pass']
-                        if (users[username]['pass'] > 6):
-                            if (save_json('users.json', users)):
-                                return json.dumps({}), 202, {"Content-type": "application/json"}
-                            else:
-                                logging.info(f'> cannot change password for {username} – saving problems')
-                                return json.dumps({'message': 'Cannot change password. Try again.'}), 500, {"Content-type": "application/json"}
-                        return json.dumps({"message": "Password was not changed. New password must restrict password rules."}), 406, {"Content-type": "application/json"}
-                    return json.dumps({"message": "Password was not changed. Enter new password."}), 400, {"Content-type": "application/json"}
-            return json.dumps({'message': f'User "{username}" not exists or token is incorrect'}), 401, {"Content-type": "application/json"}
-        return json.dumps({'message': 'Enter a token'}), 401, {"Content-type": "application/json"}
-    return json.dumps({'message': 'Enter a username'}), 401, {"Content-type": "application/json"}
-
-@server.route("/api/secure/app", methods=["POST"])
-def app_access(request):
-    return json.dumps({}), 501, {"Content-type": "application/json"}
+    user = auth.authenticate(request)
+    if not user:
+        return json.dumps({"message": "Unauthorized"}), 401, {"Content-type": "application/json"}
     
-@server.route("/api/secure/data", methods=["PUT", "PATCH"])
+    new_pass = request.data.get('pass', "")
+    if len(request.data['pass']) < 7:
+        return json.dumps({'message': 'Password too short'}), 406, {"Content-type": "application/json"}
+    
+    users = load_json('users.json')
+    users[user]['pass'] = new_pass
+    
+    if save_json('users.json', users):
+        new_credentials = auth.refresh_token(user)
+        return json.dumps({'username': user, 'newCredentials': new_credentials}), 202, {"Content-type": "application/json"}
+    else:
+        logging.info(f'> cannot change password for {user} – saving problems')
+        return json.dumps({'message': 'Internal Server Error'}), 500, {"Content-type": "application/json"}
+    
+@server.route("/api/data", methods=["PUT", "PATCH"])
 def change_data(request):
-    if ('user' in request.headers):
-        user = request.headers['user']
-        if ('token' in request.headers):
-            accessToken = request.headers['token']
-            users = load_json('users.json')
-            if (user in users):
-                if (accessToken == users[user]['token']):
-                    old = load_json('data.json')
-                    data = request.data
-                    if ('nol' not in data):
-                        data['nol'] = 3
-                    if (request.method == "PUT"):
-                        if (save_json('data.json', data)):
-                            new_credentials = refresh_token(user)
-                            return json.dumps({'old': old, 'new': data, 'newCredentials': new_credentials}), 202, {"Content-type": "application/json"}
-                        else:
-                            return json.dumps({'message': 'Cannot save', 'data': data}), 500, {"Content-type": "application/json"}
-                    else:
-                        new = old.copy()
-                        new.update(data)
-                        if (save_json('data.json', new)):
-                            new_credentials = refresh_token(user)
-                            return json.dumps({'old': old, 'new': new, 'newCredentials': new_credentials}), 202, {"Content-type": "application/json"}
-                        else:
-                            return json.dumps({'message': 'Cannot save', 'data': data}), 500, {"Content-type": "application/json"}
-    return json.dumps({}), 401, {"Content-type": "application/json"}
+    user = auth.authenticate(request)
+    if not user:
+        return json.dumps({"message": "Unauthorized"}), 401, {"Content-type": "application/json"}
+    if not auth.authorize(user, ["admin", "editor"]):
+        return json.dumps({"message": "Forbidden"}), 403, {"Content-type": "application/json"}
+    
+    old = load_json('data.json')
+    data = request.data
+    if 'nol' not in data:
+        data['nol'] = 3
+    new = data
+    if request.method == "PATCH":
+        new = old.copy()
+        new.update(data)
+    
+    if save_json('data.json', new):
+        new_credentials = auth.refresh_token(user)
+        return json.dumps({'before': old, 'after': new, 'newCredentials': new_credentials}), 202, {"Content-type": "application/json"}
+    else:
+        return json.dumps({'message': 'Internal Server Error'}), 500, {"Content-type": "application/json"}
+    
 
 @server.route("/api/secure/admin", methods=["GET"])
 def get_secure(request):
-    if ('user' in request.headers):
-        user = request.headers['user']
-        if ('token' in request.headers):
-            accessToken = request.headers['token']
-            users = load_json('users.json')
-            if (user in users):
-                if (accessToken == users[user]['token']):
-                    return json.dumps(config.secured), 200, {"Content-type": "application/json"}
-    return json.dumps({}), 401, {"Content-type": "application/json"}
+    user = auth.authenticate(request)
+    if not user:
+        return json.dumps({"message": "Unauthorized"}), 401, {"Content-type": "application/json"}
+    if not auth.authorize(user, ["admin"]):
+        return json.dumps({"message": "Forbidden"}), 403, {"Content-type": "application/json"}
+    newCredentials = auth.refresh_token(user)
+    return json.dumps({'secure': config.secured, 'newCredentials': newCredentials}), 200, {"Content-type": "application/json"}
+
+@server.route("/api/secure/users", methods=["GET"])
+def list_users_groups(request):
+    user = auth.authenticate(request)
+    if not user:
+        return json.dumps({"message": "Unauthorized"}), 401, {"Content-type": "application/json"}
+    if not auth.authorize(user, ["admin"]):
+        return json.dumps({"message": "Forbidden"}), 403, {"Content-type": "application/json"}
+    newCredentials = auth.refresh_token(user)
+    data = auth.get_users_with_groups()
+    return json.dumps({'users': data, 'newCredentials': newCredentials}), 200, {"Content-type": "application/json"}
+
+@server.route("/api/secure/users", methods=["POST"])
+def create_user_with_groups(request):
+    admin_user = auth.authenticate(request)
+    if not admin_user:
+        return json.dumps({"message": "Unauthorized"}), 401, {"Content-type": "application/json"}
+    if not auth.authorize(admin_user, ["admin"]):
+        return json.dumps({"message": "Forbidden"}), 403, {"Content-type": "application/json"}
     
+    data = request.data
+    username = data.get('user')
+    password = data.get('pass')
+    groups = data.get('groups', ['editor'])
+    
+    if not username or not password:
+        return json.dumps({"message": "Missing data"}), 400, {"Content-type": "application/json"}
+    if not auth.create_user_with_groups(username, password, groups):
+        return json.dumps({'message': 'Conflict or password too short'}), 409, {"Content-type": "application/json"}
+    newCredentials = auth.refresh_token(user)
+    return json.dumps({'username': username, 'groups': groups, 'newCredentials': newCredentials}), 200, {"Content-type": "application/json"}
+
+@server.route("/api/secure/users/<username>", methods=["DELETE"])
+def delete_user_with_roles(request, username):
+    user = auth.authenticate(request)
+    if not user:
+        return json.dumps({"message": "Unauthorized"}), 401, {"Content-type": "application/json"}
+    if not auth.authorize(user, ["admin"]):
+        return json.dumps({"message": "Forbidden"}), 403, {"Content-type": "application/json"}
+    
+    if username == 'admin':
+        return json.dumps({"message": "Forbidden"}), 403, {"Content-type": "application/json"}
+    groups = auth.get_users_with_groups()[username];
+    if not auth.remove_user_with_groups(username):
+        return json.dumps({'message': 'Conflict'}), 409, {"Content-type": "application/json"}
+    newCredentials = auth.refresh_token(user)
+    return json.dumps({'username': username, 'groups': groups, 'newCredentials': newCredentials}), 200, {"Content-type": "application/json"}
+
 @server.route("/api/wifi", methods=["PATCH"])
 def wifi_conf(request):
+    user = auth.authenticate(request)
+    if not user:
+        return json.dumps({"message": "Unauthorized"}), 401, {"Content-type": "application/json"}
+    if not auth.authorize(user, ["admin"]):
+        return json.dumps({"message": "Forbidden"}), 403, {"Content-type": "application/json"}
+    
     old = load_json('net.json')
     new = old.copy()
     new.update(request.data)
@@ -208,36 +231,30 @@ def wifi_conf(request):
     accepted['ap-ssid'] = new['ap-ssid']
     accepted['ap-pass'] = new['ap-pass']
     if (save_json('net.json', accepted)):
-        return json.dumps({'net': accepted}), 202, {"Content-type": "application/json"}
+        newCredentials = auth.refresh_token(user)
+        return json.dumps({'net': accepted, "newCredentials": newCredentials}), 202, {"Content-type": "application/json"}
     else:
-        return json.dumps({'message': 'Cannot save', 'data': accepted}), 500, {"Content-type": "application/json"}
+        return json.dumps({'message': 'Internal Server Error'}), 500, {"Content-type": "application/json"}
 
-@server.route("/api/secure/pixelprograms", methods=["PUT", "PATCH"])
+@server.route("/api/pixelprograms", methods=["PUT", "PATCH"])
 def change_pixelprograms(request):
-    if ('user' in request.headers):
-        user = request.headers['user']
-        if ('token' in request.headers):
-            accessToken = request.headers['token']
-            users = load_json('users.json')
-            if (user in users):
-                if (accessToken == users[user]['token']):
-                    old = load_json('pixelprograms.json')
-                    pixelprograms = request.data
-                    if (request.method == "PUT"):
-                        if (save_json('pixelprograms.json', pixelprograms)):
-                            new_credentials = refresh_token(user)
-                            return json.dumps({'old': old, 'new': pixelprograms, 'newCredentials': new_credentials}), 200, {"Content-type": "application/json"}
-                        else:
-                            return json.dumps({'message': 'Cannot save', 'pixelprograms': pixelprograms}), 500, {"Content-type": "application/json"}
-                    else:
-                        new = old.copy()
-                        new.extend(pixelprograms)
-                        if (save_json('pixelprograms.json', new)):
-                            new_credentials = refresh_token(user)
-                            return json.dumps({'old': old, 'new': new_credentials}), 200, {"Content-type": "application/json"}
-                        else:
-                            return json.dumps({'message': 'Cannot save', 'pixelprograms': pixelprograms}), 500, {"Content-type": "application/json"}
-    return json.dumps({}), 401, {"Content-type": "application/json"}
+    user = auth.authenticate(request)
+    if not user:
+        return json.dumps({"message": "Unauthorized"}), 401, {"Content-type": "application/json"}
+    if not auth.authorize(user, ["admin", "designer"]):
+        return json.dumps({"message": "Forbidden"}), 403, {"Content-type": "application/json"}
+    
+    old = load_json('pixelprograms.json')
+    pixelprograms = request.data
+    new = pixelprograms
+    if (request.method == "PATCH"):
+        new = old.copy()
+        new.extend(pixelprograms)
+    if (save_json('pixelprograms.json', new)):
+        new_credentials = auth.refresh_token(user)
+        return json.dumps({'before': old, 'after': new, 'newCredentials': new_credentials}), 202, {"Content-type": "application/json"}
+    else:
+        return json.dumps({'message': 'Internal Server Error'}), 500, {"Content-type": "application/json"}
 
 @server.route("/api/data", methods=["GET"])
 def get_data(request):
@@ -254,3 +271,4 @@ def get_pixelprograms(request):
 @server.catchall()
 def catchall(request):
     return json.dumps({"massage": "Page not exists"}), 404, {"Content-type": "application/json"}
+
